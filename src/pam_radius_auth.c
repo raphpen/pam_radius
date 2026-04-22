@@ -1776,7 +1776,6 @@ static int talk_radius(radius_conf_t *conf, AUTH_HDR *request, AUTH_HDR *respons
 	#else
 		rcode = select(maxfd+1, &rfds, &wfds, NULL, &tv);
 	#endif
-		gettimeofday(&now,NULL);
 	#ifndef NDEBUG
 		_pam_log(LOG_DEBUG, "DEBUG: RCODE=%i", rcode);
 	#endif
@@ -1798,14 +1797,13 @@ static int talk_radius(radius_conf_t *conf, AUTH_HDR *request, AUTH_HDR *respons
 			for( server=conf->server; server; server=server->next ) {
 				if (server->state == rad_state_dead || server->state == rad_state_ready) continue;
 
+				if (server->ip->sa_family == AF_INET) {
+					sockfd = server->sockfd != -1 ? server->sockfd : conf->sockfd;
+				} else {
+					sockfd = server->sockfd6 != -1 ? server->sockfd6 : conf->sockfd6;
+				}
+
 				if (rcode) {
-
-					if (server->ip->sa_family == AF_INET) {
-						sockfd = server->sockfd != -1 ? server->sockfd : conf->sockfd;
-					} else {
-						sockfd = server->sockfd6 != -1 ? server->sockfd6 : conf->sockfd6;
-					}
-
 			#ifndef NDEBUG
 				#ifdef HAVE_POLL_H
 					_pam_log(LOG_DEBUG, "DEBUG: Server %s state=%i events[%i]:%0X", server->hostname, server->state, numserver, fds[numserver].revents);
@@ -1948,14 +1946,16 @@ static int talk_radius(radius_conf_t *conf, AUTH_HDR *request, AUTH_HDR *respons
 				}
 
 				/* Check timeouts */
+				gettimeofday(&now,NULL);
 				//_pam_log(LOG_DEBUG,"%s: CHECK TIMEOUT", server->hostname);
 				if (timercmp(&server->ttl,&now,<)) {
-					_pam_log(LOG_ERR,"%s server %s %s %i", server->proto == rad_proto_sec ? "RADSEC": "RADIUS", server->hostname,
-							server->state == rad_state_response ? "failed to respond" : "connection timeout", server_tries);
+					_pam_log(LOG_ERR,"%s server %s %s", server->proto == rad_proto_sec ? "RADSEC": "RADIUS", server->hostname,
+							server->state == rad_state_response ? "failed to respond" : "connection timeout");
 					if ( server->proto == rad_proto_udp ) {
 						if ( --server_tries ) {
 							if ( radius_server_send( server, sockfd, request)) {
 								if (conf->debug) _pam_log(LOG_DEBUG, "Sent request to RADIUS server %s", server->hostname);
+								memcpy(&server->ttl, &now, sizeof(struct timeval));
 								server->ttl.tv_sec += server->timeout;
 								continue;
 							}
