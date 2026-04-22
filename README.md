@@ -28,6 +28,12 @@ You may disable RADSEC usage, falling back all "tls://" to RADIUS over UDP, by s
 
 By default, with "radsec=try" , if SSL  setup works, RADSEC is used for "tls://", otherwise they fallback to RADIUS over UDP.
 
+At first all TCP and TLS servers are tried together. 
+The first one ready, connected and verified, is used. If something goes wrong, the others get used, as they are ready.
+When no more TCP or TLS server are usable, UDP are tried one by one in the config order.
+
+By aware on some system you may need to disable SELinux or apply a proper SELinux policy.
+
 ------------------------------------------------------------------------------
 
 This is the PAM to RADIUS authentication module.  It allows any Linux, OSX or
