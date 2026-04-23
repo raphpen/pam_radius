@@ -1573,55 +1573,63 @@ static int talk_radius(radius_conf_t *conf, AUTH_HDR *request, AUTH_HDR *respons
 
 	 */
 
-	/* Let's find if they are any TCP/TLS server
-     * and start to connect them.
-     */ 
 	numserver = 0;
 	server = conf->server;
-	for (;server != NULL; server=server->next) {
-		if (server->state == rad_state_dead) continue;
 
-		/* only look up IP information as necessary */
-		rcode = host2server(conf->debug, server);
-		if (rcode != 0) {
-			server->state = rad_state_dead;
-			_pam_log(LOG_ERR,
-				 "Failed looking up IP address for RADIUS server %s (error=%s)",
-				 server->hostname, gai_strerror(rcode));
-			continue;
-		}
+	/* Check if we are already talking with a server 
+ 	 * and use it.
+ 	 */ 
+	if (server->state == rad_state_response) {
+		server->state = rad_state_ready;
+	}
+	else {
+		/* Let's find if they are any TCP/TLS server
+		 * and start to connect them.
+		 */ 
+		for (;server != NULL; server=server->next) {
+			if (server->state == rad_state_dead) continue;
 
-		server->ttl.tv_sec = server->ttl.tv_usec = 0;
-		if (server->proto) { 
-			if( (sockfd = server->ip->sa_family == AF_INET ? server->sockfd : server->sockfd6) == -1) {
-				_pam_log(LOG_ERR,
-				 	"Failed looking up a socket for RADIUS server %s",
-				 	server->hostname);
+			/* only look up IP information as necessary */
+			rcode = host2server(conf->debug, server);
+			if (rcode != 0) {
 				server->state = rad_state_dead;
+				_pam_log(LOG_ERR,
+					 "Failed looking up IP address for RADIUS server %s (error=%s)",
+					 server->hostname, gai_strerror(rcode));
 				continue;
 			}
-		// verificare che sia ancora in state_connect
-		#ifdef HAVE_LIBSSL
-			if (server->proto == rad_proto_sec) {
-				if (!(server->ssl = SSL_new(conf->ssl))) {
-					_pam_log(LOG_ERR,"RADSEC server %s TLS initialization failed", server->hostname);
+
+			server->ttl.tv_sec = server->ttl.tv_usec = 0;
+			if (server->proto) { 
+				if( (sockfd = server->ip->sa_family == AF_INET ? server->sockfd : server->sockfd6) == -1) {
+					_pam_log(LOG_ERR,
+				 		"Failed looking up a socket for RADIUS server %s",
+				 		server->hostname);
 					server->state = rad_state_dead;
 					continue;
 				}
-				SSL_set_fd(server->ssl,sockfd);
-			}
-		#endif
-			if (sock_set_nonblock(sockfd) != -1 && sock_set_keepalive(sockfd) != -1) {
-				if (connect(sockfd, server->ip, server->ip->sa_family == AF_INET? sizeof(struct sockaddr_in): sizeof(struct sockaddr_in6) )==-1) {
-					if (errno == EINPROGRESS) {
-						numserver++;
+			#ifdef HAVE_LIBSSL
+				if (server->proto == rad_proto_sec) {
+					if (!(server->ssl = SSL_new(conf->ssl))) {
+						_pam_log(LOG_ERR,"RADSEC server %s TLS initialization failed", server->hostname);
+						server->state = rad_state_dead;
 						continue;
 					}
+					SSL_set_fd(server->ssl,sockfd);
 				}
+			#endif
+				if (sock_set_nonblock(sockfd) != -1 && sock_set_keepalive(sockfd) != -1) {
+					if (connect(sockfd, server->ip, server->ip->sa_family == AF_INET? sizeof(struct sockaddr_in): sizeof(struct sockaddr_in6) )==-1) {
+						if (errno == EINPROGRESS) {
+							numserver++;
+							continue;
+						}
+					}
+				}
+				get_error_string(errno, error_string, sizeof(error_string));
+				_pam_log(LOG_ERR,"%s server %s connection failed: %s", server->proto == rad_proto_tcp ? "RADIUS": "RADSEC", server->hostname, error_string);
+				server->state = rad_state_dead;
 			}
-			get_error_string(errno, error_string, sizeof(error_string));
-			_pam_log(LOG_ERR,"%s server %s connection failed: %s", server->proto == rad_proto_tcp ? "RADIUS": "RADSEC", server->hostname, error_string);
-			server->state = rad_state_dead;
 		}
 	}
 
@@ -1633,6 +1641,7 @@ static int talk_radius(radius_conf_t *conf, AUTH_HDR *request, AUTH_HDR *respons
 		return PAM_AUTHINFO_UNAVAIL;
 #endif
 
+	gettimeofday(&now,NULL);
 	while (1) 
 	{
 #ifndef HAVE_POLL_H
@@ -1640,7 +1649,6 @@ static int talk_radius(radius_conf_t *conf, AUTH_HDR *request, AUTH_HDR *respons
 		FD_ZERO(&rfds);
 		FD_ZERO(&wfds);
 #endif
-		gettimeofday(&now,NULL);
 		memset(&tv,0,sizeof(struct timeval));
 
 		numserver = 0;
@@ -1779,6 +1787,7 @@ static int talk_radius(radius_conf_t *conf, AUTH_HDR *request, AUTH_HDR *respons
 	#ifndef NDEBUG
 		_pam_log(LOG_DEBUG, "DEBUG: RCODE=%i", rcode);
 	#endif
+		gettimeofday(&now,NULL);
 		if(rcode == -1) {
 			if (errno != EINTR) {
 				get_error_string(errno, error_string, sizeof(error_string));
@@ -1938,15 +1947,30 @@ static int talk_radius(radius_conf_t *conf, AUTH_HDR *request, AUTH_HDR *respons
 						 	* Whew! The poll is done. It hasn't timed out, or errored out.
 						 	* It's our descriptor.	We've got some data. It's the right size.
 						 	* The packet is valid.
-						 	* NOW, we can skip out of the loop, and process the packet
+						 	* NOW, we can cleanup all other servers, and keep only the active one,
+						 	* for any further request (eg. Access-Challenge)
 						 	*/
+							
+							radius_server_t *prev=NULL;
+							for(server = conf->server; server; prev = server, server = server->next) {
+								if (server == active_server) {
+									cleanup(server->next);
+									server->next = NULL;
+									if (prev) {
+										prev->next = NULL;
+										cleanup(conf->server);
+									}
+									break;
+								}
+							}
+							conf->server = active_server;
+							
 							return PAM_SUCCESS;
 						}
 					}				
 				}
 
 				/* Check timeouts */
-				gettimeofday(&now,NULL);
 				//_pam_log(LOG_DEBUG,"%s: CHECK TIMEOUT", server->hostname);
 				if (timercmp(&server->ttl,&now,<)) {
 					_pam_log(LOG_ERR,"%s server %s %s", server->proto == rad_proto_sec ? "RADSEC": "RADIUS", server->hostname,
